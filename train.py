@@ -111,19 +111,13 @@ def main(args):
             noisy_images = noise_scheduler.add_noise(clean_images, noise,
                                                      timesteps)
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                noise_pred = model(noisy_images, timesteps)["sample"]
-                loss = loss_fn(noise_pred, noise)
+            noise_pred = model(noisy_images, timesteps)["sample"]
+            loss = F.l1_loss(noise_pred, noise)
+            loss.backward()
 
-            # loss.backward()
-            # if args.use_clip_grad:
-            #     clip_grad_norm_(model.parameters(), 1.0)
-            # optimizer.step()
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
+            if args.use_clip_grad:
+                clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 

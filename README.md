@@ -21,6 +21,11 @@ Training was done for `40k steps`, with a batch size of `64`. Learning rate was 
 
 Hidden dims of `[16, 32, 64, 128]` were used, which resulted in a total of `2,346,835` million params.
 
+To train the model, run the following command:
+```
+ python train.py   --dataset_name="huggan/flowers-102-categories"   --resolution=64   --output_dir="trained_models/ddpm-ema-pokemons-64.pth"   --train_batch_size=16   --num_epochs=121 --gradient_accumulation_steps=1   --learning_rate=1e-4   --lr_warmup_steps=300
+```
+
 
 
 ### Conclusions
