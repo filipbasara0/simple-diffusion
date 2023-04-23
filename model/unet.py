@@ -2,15 +2,27 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from einops.layers.torch import Rearrange
 
 from model._attention import LinearAttention, Attention, LayerNorm
 
 
 def get_downsample_layer(in_dim, hidden_dim, is_last):
     if not is_last:
-        return nn.Conv2d(in_dim, hidden_dim, 4, 2, 1)
+        return nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1=2, p2=2),
+            nn.Conv2d(in_dim * 4, hidden_dim, 1))
     else:
         return nn.Conv2d(in_dim, hidden_dim, 3, padding=1)
+
+
+def get_attn_layer(in_dim, is_last, use_linear_attn):
+    if is_last:
+        return Residual(PreNorm(in_dim, Attention(in_dim)))
+    elif use_linear_attn:
+        return Residual(PreNorm(in_dim, LinearAttention(in_dim)))
+    else:
+        return nn.Identity()
 
 
 def get_upsample_layer(in_dim, hidden_dim, is_last):
@@ -23,7 +35,8 @@ def get_upsample_layer(in_dim, hidden_dim, is_last):
 
 def sinusoidal_embedding(timesteps, dim):
     half_dim = dim // 2
-    exponent = -math.log(10000) * torch.arange(start=0, end=half_dim, dtype=torch.float32)
+    exponent = -math.log(10000) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32)
     exponent = exponent / (half_dim - 1.0)
 
     emb = torch.exp(exponent).to(device=timesteps.device)
@@ -68,7 +81,8 @@ class ResidualBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.time_emb_proj = nn.Sequential(nn.SiLU(), torch.nn.Linear(temb_channels, out_channels))
+        self.time_emb_proj = nn.Sequential(
+            nn.SiLU(), torch.nn.Linear(temb_channels, out_channels))
 
         self.residual_conv = nn.Conv2d(
             in_channels, out_channels=out_channels,
@@ -111,7 +125,8 @@ class UNet(nn.Module):
     def __init__(self,
                  in_channels,
                  hidden_dims=[64, 128, 256, 512],
-                 image_size=64):
+                 image_size=64,
+                 use_linear_attn=False):
         super(UNet, self).__init__()
 
         self.sample_size = image_size
@@ -122,10 +137,8 @@ class UNet(nn.Module):
         time_embed_dim = timestep_input_dim * 4
 
         self.time_embedding = nn.Sequential(
-            nn.Linear(timestep_input_dim, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim)
-        )
+            nn.Linear(timestep_input_dim, time_embed_dim), nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim))
 
         self.init_conv = nn.Conv2d(in_channels,
                                    out_channels=hidden_dims[0],
@@ -142,7 +155,7 @@ class UNet(nn.Module):
                 nn.ModuleList([
                     ResidualBlock(in_dim, in_dim, time_embed_dim),
                     ResidualBlock(in_dim, in_dim, time_embed_dim),
-                    Residual(PreNorm(in_dim, LinearAttention(in_dim))),
+                    get_attn_layer(in_dim, is_last, use_linear_attn),
                     get_downsample_layer(in_dim, hidden_dim, is_last)
                 ]))
             in_dim = hidden_dim
@@ -162,19 +175,22 @@ class UNet(nn.Module):
                 nn.ModuleList([
                     ResidualBlock(in_dim + hidden_dim, in_dim, time_embed_dim),
                     ResidualBlock(in_dim + hidden_dim, in_dim, time_embed_dim),
-                    Residual(PreNorm(in_dim, LinearAttention(in_dim))),
+                    get_attn_layer(in_dim, is_last, use_linear_attn),
                     get_upsample_layer(in_dim, hidden_dim, is_last)
                 ]))
             in_dim = hidden_dim
 
         self.up_blocks = nn.ModuleList(up_blocks)
 
-        self.out_block = ResidualBlock(hidden_dims[0] * 2, hidden_dims[0], time_embed_dim)
+        self.out_block = ResidualBlock(hidden_dims[0] * 2, hidden_dims[0],
+                                       time_embed_dim)
         self.conv_out = nn.Conv2d(hidden_dims[0], out_channels=3, kernel_size=1)
 
     def forward(self, sample, timesteps):
         if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+            timesteps = torch.tensor([timesteps],
+                                     dtype=torch.long,
+                                     device=sample.device)
 
         timesteps = torch.flatten(timesteps)
         timesteps = timesteps.broadcast_to(sample.shape[0])

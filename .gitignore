@@ -132,3 +132,5 @@ dmypy.json
 test_samples
 trained_models
 training_logs
+
+data/

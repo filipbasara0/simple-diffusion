@@ -123,6 +123,7 @@ class DDIMScheduler:
         return prev_sample
 
     def add_noise(self, original_samples, noise, timesteps):
+        timesteps = timesteps.cpu()
         sqrt_alpha_prod = self.alphas_cumprod[timesteps]**0.5
         sqrt_alpha_prod = match_shape(sqrt_alpha_prod, original_samples)
         sqrt_one_minus_alpha_prod = (1 - self.alphas_cumprod[timesteps])**0.5

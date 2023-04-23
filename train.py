@@ -1,5 +1,4 @@
 import argparse
-from datetime import datetime
 
 import torch
 import torch.nn.functional as F
@@ -21,16 +20,24 @@ from torchinfo import summary
 from scheduler import DDIMScheduler
 from model import UNet
 from utils import save_images, normalize_to_neg_one_to_one, plot_losses
-
+from dataset import CustomDataset
+import pandas as pd
 
 n_timesteps = 1000
 n_inference_timesteps = 50
 
 
 def main(args):
-    model = UNet(3, image_size=args.resolution, hidden_dims=[16, 32, 64, 128])
+    model = UNet(3,
+                 image_size=args.resolution,
+                 hidden_dims=[128, 256, 512, 1024],
+                 use_linear_attn=False)
     noise_scheduler = DDIMScheduler(num_train_timesteps=n_timesteps,
                                     beta_schedule="cosine")
+
+    if args.pretrained_model_path:
+        pretrained = torch.load(args.pretrained_model_path)["model_state"]
+        model.load_state_dict(pretrained, strict=False)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -48,27 +55,27 @@ def main(args):
     ])
 
     if args.dataset_name is not None:
+
+        def transforms(examples):
+            images = [
+                augmentations(image.convert("RGB"))
+                for image in examples["image"]
+            ]
+            return {"input": images}
+
         dataset = load_dataset(
             args.dataset_name,
             args.dataset_config_name,
             cache_dir=args.cache_dir,
             split="train",
         )
+        dataset.set_transform(transforms)
     else:
-        dataset = load_dataset("imagefolder",
-                                data_dir=args.train_data_dir,
-                                cache_dir=args.cache_dir,
-                                split="train")
+        df = pd.read_pickle(args.train_data_path)
+        dataset = CustomDataset(df, augmentations)
 
-    def transforms(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["image"]]
-        return {"input": images}
-
-    dataset.set_transform(transforms)
-
-    train_dataloader = torch.utils.data.DataLoader(dataset,
-                                                   batch_size=args.train_batch_size,
-                                                   shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.train_batch_size, shuffle=True)
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -80,8 +87,10 @@ def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    summary(model, [(1, 3, args.resolution, args.resolution), (1,)], verbose=1)
+    summary(model, [(1, 3, args.resolution, args.resolution), (1, )], verbose=1)
 
+    loss_fn = F.l1_loss if args.use_l1_loss else F.mse_loss
+    scaler = torch.cuda.amp.GradScaler()
     global_step = 0
     losses = []
     for epoch in range(args.num_epochs):
@@ -92,20 +101,29 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             clean_images = batch["input"].to(device)
             clean_images = normalize_to_neg_one_to_one(clean_images)
-            
+
             batch_size = clean_images.shape[0]
             noise = torch.randn(clean_images.shape).to(device)
-            timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, 
-                                     (batch_size,), device=device).long()
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            timesteps = torch.randint(0,
+                                      noise_scheduler.num_train_timesteps,
+                                      (batch_size, ),
+                                      device=device).long()
+            noisy_images = noise_scheduler.add_noise(clean_images, noise,
+                                                     timesteps)
 
-            noise_pred = model(noisy_images, timesteps)["sample"]
-            loss = F.l1_loss(noise_pred, noise)
-            loss.backward()
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                noise_pred = model(noisy_images, timesteps)["sample"]
+                loss = loss_fn(noise_pred, noise)
 
-            if args.use_clip_grad:
-                clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # loss.backward()
+            # if args.use_clip_grad:
+            #     clip_grad_norm_(model.parameters(), 1.0)
+            # optimizer.step()
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             lr_scheduler.step()
             optimizer.zero_grad()
 
@@ -136,7 +154,7 @@ def main(args):
                     use_clipped_model_output=True,
                     batch_size=args.eval_batch_size,
                     output_type="numpy")
-                
+
                 save_images(generated_images, epoch, args)
                 plot_losses(losses, f"{args.loss_logs_dir}/{epoch}/")
 
@@ -148,14 +166,17 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(
+        description="Simple example of a training script.")
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_config_name", type=str, default=None)
-    parser.add_argument("--train_data_dir",
+    parser.add_argument("--train_data_path",
                         type=str,
                         default=None,
-                        help="A folder containing the training data.")
-    parser.add_argument("--output_dir", type=str, default="trained_models/ddpm-model-64.pth")
+                        help="A df containing paths to training images.")
+    parser.add_argument("--output_dir",
+                        type=str,
+                        default="trained_models/ddpm-model-64.pth")
     parser.add_argument("--samples_dir", type=str, default="test_samples/")
     parser.add_argument("--loss_logs_dir", type=str, default="training_logs")
     parser.add_argument("--cache_dir", type=str, default=None)
@@ -173,13 +194,18 @@ if __name__ == "__main__":
     parser.add_argument("--adam_weight_decay", type=float, default=1e-5)
     parser.add_argument("--adam_epsilon", type=float, default=1e-08)
     parser.add_argument("--use_clip_grad", type=bool, default=False)
+    parser.add_argument("--use_l1_loss", type=bool, default=False)
     parser.add_argument("--logging_dir", type=str, default="logs")
-
+    parser.add_argument("--pretrained_model_path",
+                        type=str,
+                        default=None,
+                        help="Path to pretrained model")
 
     args = parser.parse_args()
 
-    if args.dataset_name is None and args.train_data_dir is None:
+    if args.dataset_name is None and args.train_data_path is None:
         raise ValueError(
-            "You must specify either a dataset name from the hub or a train data directory.")
+            "You must specify either a dataset name from the hub or a train data directory."
+        )
 
     main(args)

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 
 def plot_losses(losses, out_dir):
-    os.makedirs(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
     plt.plot(losses, label='train')
     plt.legend()
     plt.savefig(f"{out_dir}/losses.png")
