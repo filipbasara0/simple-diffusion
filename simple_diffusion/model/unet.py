@@ -4,7 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 from einops.layers.torch import Rearrange
 
-from model._attention import LinearAttention, Attention, LayerNorm
+from simple_diffusion.model._attention import Attention
 
 
 def get_downsample_layer(in_dim, hidden_dim, is_last):
@@ -16,11 +16,9 @@ def get_downsample_layer(in_dim, hidden_dim, is_last):
         return nn.Conv2d(in_dim, hidden_dim, 3, padding=1)
 
 
-def get_attn_layer(in_dim, is_last, use_linear_attn):
-    if is_last:
-        return Residual(PreNorm(in_dim, Attention(in_dim)))
-    elif use_linear_attn:
-        return Residual(PreNorm(in_dim, LinearAttention(in_dim)))
+def get_attn_layer(in_dim, use_full_attn):
+    if use_full_attn:
+        return Attention(in_dim)
     else:
         return nn.Identity()
 
@@ -43,28 +41,6 @@ def sinusoidal_embedding(timesteps, dim):
     emb = timesteps[:, None].float() * emb[None, :]
 
     return torch.cat([emb.sin(), emb.cos()], dim=-1)
-
-
-class Residual(nn.Module):
-
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x, *args, **kwargs):
-        return self.fn(x, *args, **kwargs) + x
-
-
-class PreNorm(nn.Module):
-
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.fn = fn
-        self.norm = LayerNorm(dim)
-
-    def forward(self, x):
-        x = self.norm(x)
-        return self.fn(x)
 
 
 class ResidualBlock(nn.Module):
@@ -125,8 +101,7 @@ class UNet(nn.Module):
     def __init__(self,
                  in_channels,
                  hidden_dims=[64, 128, 256, 512],
-                 image_size=64,
-                 use_linear_attn=False):
+                 image_size=64):
         super(UNet, self).__init__()
 
         self.sample_size = image_size
@@ -151,11 +126,12 @@ class UNet(nn.Module):
         in_dim = hidden_dims[0]
         for idx, hidden_dim in enumerate(hidden_dims[1:]):
             is_last = idx >= (len(hidden_dims) - 2)
+            is_first = idx == 0
             down_blocks.append(
                 nn.ModuleList([
                     ResidualBlock(in_dim, in_dim, time_embed_dim),
                     ResidualBlock(in_dim, in_dim, time_embed_dim),
-                    get_attn_layer(in_dim, is_last, use_linear_attn),
+                    get_attn_layer(in_dim, not is_first),
                     get_downsample_layer(in_dim, hidden_dim, is_last)
                 ]))
             in_dim = hidden_dim
@@ -164,7 +140,7 @@ class UNet(nn.Module):
 
         mid_dim = hidden_dims[-1]
         self.mid_block1 = ResidualBlock(mid_dim, mid_dim, time_embed_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_attn = Attention(mid_dim)
         self.mid_block2 = ResidualBlock(mid_dim, mid_dim, time_embed_dim)
 
         up_blocks = []
@@ -175,7 +151,7 @@ class UNet(nn.Module):
                 nn.ModuleList([
                     ResidualBlock(in_dim + hidden_dim, in_dim, time_embed_dim),
                     ResidualBlock(in_dim + hidden_dim, in_dim, time_embed_dim),
-                    get_attn_layer(in_dim, is_last, use_linear_attn),
+                    get_attn_layer(in_dim, not is_last),
                     get_upsample_layer(in_dim, hidden_dim, is_last)
                 ]))
             in_dim = hidden_dim
