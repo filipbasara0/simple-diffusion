@@ -8,8 +8,8 @@ import os
 from PIL import Image
 from torchvision import utils
 
-from scheduler import DDIMScheduler
-from model import UNet
+from simple_diffusion.scheduler import DDIMScheduler
+from simple_diffusion.model import UNet
 
 n_timesteps = 1000
 n_inference_timesteps = 50

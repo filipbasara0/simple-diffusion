@@ -8,28 +8,23 @@ from torchvision import utils
 import matplotlib.pyplot as plt
 
 
-def plot_losses(losses, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    plt.plot(losses, label='train')
-    plt.legend()
-    plt.savefig(f"{out_dir}/losses.png")
-    plt.clf()
-
-
-def save_images(generated_images, epoch, args):
+def save_images(generated_images, epoch, args, contexts=None):
     images = generated_images["sample"]
     images_processed = (images * 255).round().astype("uint8")
-    
+
     current_date = datetime.today().strftime('%Y%m%d_%H%M%S')
     out_dir = f"./{args.samples_dir}/{current_date}_{args.dataset_name}_{epoch}/"
     os.makedirs(out_dir)
     for idx, image in enumerate(images_processed):
         image = Image.fromarray(image)
-        image.save(f"{out_dir}/{epoch}_{idx}.jpeg")
+        if contexts:
+            image.save(f"{out_dir}/{epoch}_{contexts[idx]}_{idx}.jpeg")
+        else:
+            image.save(f"{out_dir}/{epoch}_{idx}.jpeg")
 
     utils.save_image(generated_images["sample_pt"],
-                        f"{out_dir}/{epoch}_grid.jpeg",
-                        nrow=args.eval_batch_size // 4)
+                     f"{out_dir}/{epoch}_grid.jpeg",
+                     nrow=args.eval_batch_size // 4)
 
 
 def normalize_to_neg_one_to_one(img):
