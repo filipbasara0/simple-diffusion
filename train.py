@@ -5,12 +5,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.cuda.amp import GradScaler, autocast
-from torchvision.transforms import (
-    Compose,
-    RandomHorizontalFlip,
-    Resize,
-    ToTensor,
-)
 import torchvision.transforms as transforms
 from datasets import load_dataset
 from diffusers.optimization import get_scheduler
@@ -24,7 +18,7 @@ from simple_diffusion.dataset import CustomDataset, get_dataset
 import pandas as pd
 import webdataset as wds
 
-from ema_pytorch import EMA
+from simple_diffusion.ema import EMA
 
 SEED = 42
 
@@ -36,26 +30,28 @@ torch.cuda.manual_seed(SEED)
 n_timesteps = 1000
 n_inference_timesteps = 250
 
+def _grayscale_to_rgb(img):
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
+
 
 def main(args):
-    model = UNet(3, image_size=args.resolution, hidden_dims=[128, 256, 512, 1024])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNet(3, image_size=args.resolution, hidden_dims=[64, 128, 256, 512])
     noise_scheduler = DDIMScheduler(num_train_timesteps=n_timesteps,
-                                    beta_schedule="cosine")  # cosine linear
+                                    beta_schedule="cosine")
+    model = model.to(device)
 
     if args.pretrained_model_path:
         pretrained = torch.load(args.pretrained_model_path)["model_state"]
         model.load_state_dict(pretrained)
-
-    ema_update_every = 10
-    ema_decay = 0.995
-    ema = EMA(model, beta=ema_decay, update_every=ema_update_every)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
     )
 
     tfms = transforms.Compose([
@@ -65,12 +61,6 @@ def main(args):
     ])
 
     if args.dataset_name in ["combined", "yfcc7m"]:
-
-        def _grayscale_to_rgb(img):
-            if img.mode != "RGB":
-                return img.convert("RGB")
-            return img
-
         dataset = get_dataset(args.dataset_name,
                               args.dataset_path,
                               transforms=tfms)
@@ -104,16 +94,18 @@ def main(args):
             dataset, batch_size=args.train_batch_size, shuffle=True)
         steps_per_epcoch = len(train_dataloader)
 
+    total_num_steps = (steps_per_epcoch * args.num_epochs) // args.gradient_accumulation_steps
+    total_num_steps += int(total_num_steps * 10/100)
+    gamma = args.gamma
+    ema = EMA(model, gamma, total_num_steps)
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps,
-        num_training_steps=(steps_per_epcoch * args.num_epochs) //
-        args.gradient_accumulation_steps,
+        num_training_steps=total_num_steps,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ema = ema.to(device)
     summary(model, [(1, 3, args.resolution, args.resolution), (1,)], verbose=1)
 
     scaler = GradScaler(enabled=args.fp16_precision)
@@ -125,7 +117,6 @@ def main(args):
         losses_log = 0
         for step, batch in enumerate(train_dataloader):
             clean_images = batch["image"].to(device)
-            # clean_images = batch["input"].to(device)
             clean_images = normalize_to_neg_one_to_one(clean_images)
 
             batch_size = clean_images.shape[0]
@@ -146,7 +137,8 @@ def main(args):
             scaler.step(optimizer)
             scaler.update()
 
-            ema.update()
+            ema.update_params(gamma)
+            gamma = ema.update_gamma(global_step)
 
             if args.use_clip_grad:
                 clip_grad_norm_(model.parameters(), 1.0)
@@ -159,7 +151,8 @@ def main(args):
                 "loss_avg": losses_log / (step + 1),
                 "loss": loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
-                "step": global_step
+                "step": global_step,
+                "gamma": gamma
             }
 
             progress_bar.set_postfix(**logs)
@@ -216,13 +209,11 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--lr_scheduler", type=str, default="cosine")
-    parser.add_argument("--lr_warmup_steps", type=int, default=1000)
-    parser.add_argument("--adam_beta1", type=float, default=0.95)
-    parser.add_argument("--adam_beta2", type=float, default=0.999)
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-5)
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08)
+    parser.add_argument("--lr_warmup_steps", type=int, default=100)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.99)
+    parser.add_argument("--adam_weight_decay", type=float, default=0.0)
     parser.add_argument("--use_clip_grad", type=bool, default=False)
-    parser.add_argument("--use_l1_loss", type=bool, default=False)
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--pretrained_model_path",
                         type=str,
@@ -231,6 +222,10 @@ if __name__ == "__main__":
     parser.add_argument('--fp16_precision',
                         action='store_true',
                         help='Whether to use 16-bit precision for GPU training')
+    parser.add_argument('--gamma',
+                    default=0.996,
+                    type=float,
+                    help='Initial EMA coefficient')
 
     args = parser.parse_args()
 

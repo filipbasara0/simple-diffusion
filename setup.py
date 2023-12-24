@@ -29,8 +29,8 @@ setup(
     install_requires=[
         'torch>=2.1', 'torchvision>=0.16', 'transformers>=4.35',
         'datasets>=2.15', 'tqdm>=4.66', 'torchinfo>=1.8.0',
-        'webdataset>=0.2.77', 'matplotlib>=3.6.0', 'diffusers>=0.24.0',
-        'einops>=0.7.0', 'ema-pytorch==0.3.1'
+        'matplotlib>=3.6.0', 'diffusers>=0.24.0', 'einops>=0.7.0',
+        'webdataset>=0.2.77',
     ],
     classifiers=[
         'Development Status :: 4 - Beta',
