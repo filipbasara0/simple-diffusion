@@ -17,7 +17,6 @@ def get_downsample_layer(in_dim, hidden_dim, is_last):
 
 
 def get_attn_layer(in_dim, use_full_attn, use_flash_attn):
-    print(in_dim, use_full_attn, use_flash_attn)
     if use_full_attn:
         return Attention(in_dim, use_flash_attn=use_flash_attn)
     else:
