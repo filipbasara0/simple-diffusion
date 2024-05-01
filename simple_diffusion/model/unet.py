@@ -16,9 +16,10 @@ def get_downsample_layer(in_dim, hidden_dim, is_last):
         return nn.Conv2d(in_dim, hidden_dim, 3, padding=1)
 
 
-def get_attn_layer(in_dim, use_full_attn):
+def get_attn_layer(in_dim, use_full_attn, use_flash_attn):
+    print(in_dim, use_full_attn, use_flash_attn)
     if use_full_attn:
-        return Attention(in_dim)
+        return Attention(in_dim, use_flash_attn=use_flash_attn)
     else:
         return nn.Identity()
 
@@ -101,7 +102,8 @@ class UNet(nn.Module):
     def __init__(self,
                  in_channels,
                  hidden_dims=[64, 128, 256, 512],
-                 image_size=64):
+                 image_size=64,
+                 use_flash_attn=False):
         super(UNet, self).__init__()
 
         self.sample_size = image_size
@@ -127,11 +129,12 @@ class UNet(nn.Module):
         for idx, hidden_dim in enumerate(hidden_dims[1:]):
             is_last = idx >= (len(hidden_dims) - 2)
             is_first = idx == 0
+            use_attn = True if use_flash_attn else not is_first
             down_blocks.append(
                 nn.ModuleList([
                     ResidualBlock(in_dim, in_dim, time_embed_dim),
                     ResidualBlock(in_dim, in_dim, time_embed_dim),
-                    get_attn_layer(in_dim, not is_first),
+                    get_attn_layer(in_dim, use_attn, use_flash_attn),
                     get_downsample_layer(in_dim, hidden_dim, is_last)
                 ]))
             in_dim = hidden_dim
@@ -147,11 +150,12 @@ class UNet(nn.Module):
         in_dim = mid_dim
         for idx, hidden_dim in enumerate(list(reversed(hidden_dims[:-1]))):
             is_last = idx >= (len(hidden_dims) - 2)
+            use_attn = True if use_flash_attn else not is_last
             up_blocks.append(
                 nn.ModuleList([
                     ResidualBlock(in_dim + hidden_dim, in_dim, time_embed_dim),
                     ResidualBlock(in_dim + hidden_dim, in_dim, time_embed_dim),
-                    get_attn_layer(in_dim, not is_last),
+                    get_attn_layer(in_dim, use_attn, use_flash_attn),
                     get_upsample_layer(in_dim, hidden_dim, is_last)
                 ]))
             in_dim = hidden_dim

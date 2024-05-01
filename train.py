@@ -38,7 +38,8 @@ def _grayscale_to_rgb(img):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNet(3, image_size=args.resolution, hidden_dims=[64, 128, 256, 512])
+    model = UNet(3, image_size=args.resolution, hidden_dims=[64, 128, 256, 512],
+                 use_flash_attn=args.use_flash_attn)
     noise_scheduler = DDIMScheduler(num_train_timesteps=n_timesteps,
                                     beta_schedule="cosine")
     model = model.to(device)
@@ -65,6 +66,12 @@ def main(args):
                               args.dataset_path,
                               transforms=tfms)
     elif args.dataset_name is not None:
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            split="train",
+        )
 
         def aug(examples):
             images = [
@@ -72,16 +79,16 @@ def main(args):
             ]
             return {"image": images}
 
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
         dataset.set_transform(aug)
     else:
+        def aug(examples):
+            images = [
+                tfms(image) for image in examples
+            ]
+            return {"image": images}
+
         df = pd.read_pickle(args.dataset_path)
-        dataset = CustomDataset(df, aug)
+        dataset = CustomDataset(df, tfms)
 
     if args.dataset_name == "yfcc7m":
         train_dataloader = wds.WebLoader(dataset,
@@ -213,7 +220,8 @@ if __name__ == "__main__":
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.99)
     parser.add_argument("--adam_weight_decay", type=float, default=0.0)
-    parser.add_argument("--use_clip_grad", type=bool, default=False)
+    parser.add_argument("--use_clip_grad", action='store_true')
+    parser.add_argument('--use_flash_attn', action='store_true')
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--pretrained_model_path",
                         type=str,
@@ -229,7 +237,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.dataset_name is None and args.train_data_path is None:
+    if args.dataset_name is None and args.dataset_path is None:
         raise ValueError(
             "You must specify either a dataset name from the hub or a train data directory."
         )
