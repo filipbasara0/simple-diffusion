@@ -12,20 +12,22 @@ from simple_diffusion.scheduler import DDIMScheduler
 from simple_diffusion.model import UNet
 
 n_timesteps = 1000
-n_inference_timesteps = 50
+n_inference_timesteps = 250
 
 
 def main(args):
-    model = UNet(3, image_size=args.resolution, hidden_dims=[128, 256, 512])
+    model = UNet(3, image_size=args.resolution, hidden_dims=[64, 128, 256, 512],
+                 use_flash_attn=args.use_flash_attn)
     noise_scheduler = DDIMScheduler(num_train_timesteps=n_timesteps,
                                     beta_schedule="cosine")
 
-    pretrained = torch.load(args.pretrained_model_path)["model_state"]
+    pretrained = torch.load(args.pretrained_model_path)["ema_model_state"]
     model.load_state_dict(pretrained, strict=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
+    
+    model.eval()
     with torch.no_grad():
         # has to be instantiated every time, because of reproducibility
         generator = torch.manual_seed(0)
@@ -33,10 +35,8 @@ def main(args):
             model,
             num_inference_steps=n_inference_timesteps,
             generator=generator,
-            eta=0.5,
-            use_clipped_model_output=True,
-            batch_size=args.eval_batch_size,
-            output_type="numpy")
+            eta=1.0,
+            batch_size=args.eval_batch_size)
 
         images = generated_images["sample"]
         images_processed = (images * 255).round().astype("uint8")
@@ -62,6 +62,8 @@ if __name__ == "__main__":
                         type=str,
                         default=None,
                         help="Path to pretrained model")
+    parser.add_argument("--eval_batch_size", type=int, default=16)
+    parser.add_argument('--use_flash_attn', action='store_true')
 
     args = parser.parse_args()
 

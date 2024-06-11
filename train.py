@@ -13,7 +13,7 @@ from torchinfo import summary
 
 from simple_diffusion.scheduler import DDIMScheduler
 from simple_diffusion.model import UNet
-from simple_diffusion.utils import save_images, normalize_to_neg_one_to_one
+from simple_diffusion.utils import save_images
 from simple_diffusion.dataset import CustomDataset, get_dataset
 import pandas as pd
 import webdataset as wds
@@ -58,7 +58,9 @@ def main(args):
     tfms = transforms.Compose([
         transforms.Resize((args.resolution, args.resolution)),
         transforms.Lambda(_grayscale_to_rgb),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        # normalize to [-1, 1] for faster convergence and numerical stability
+        transforms.Lambda(lambda x: x * 2 - 1)
     ])
 
     if args.dataset_name in ["combined", "yfcc7m"]:
@@ -123,16 +125,15 @@ def main(args):
         progress_bar.set_description(f"Epoch {epoch}")
         losses_log = 0
         for step, batch in enumerate(train_dataloader):
-            clean_images = batch["image"].to(device)
-            clean_images = normalize_to_neg_one_to_one(clean_images)
+            orig_images = batch["image"].to(device)
 
-            batch_size = clean_images.shape[0]
-            noise = torch.randn(clean_images.shape).to(device)
+            batch_size = orig_images.shape[0]
+            noise = torch.randn(orig_images.shape).to(device)
             timesteps = torch.randint(0,
                                       noise_scheduler.num_train_timesteps,
                                       (batch_size,),
                                       device=device).long()
-            noisy_images = noise_scheduler.add_noise(clean_images, noise,
+            noisy_images = noise_scheduler.add_noise(orig_images, noise,
                                                      timesteps)
 
             optimizer.zero_grad()
@@ -176,9 +177,7 @@ def main(args):
                         num_inference_steps=n_inference_timesteps,
                         generator=generator,
                         eta=1.0,
-                        use_clipped_model_output=True,
-                        batch_size=args.eval_batch_size,
-                        output_type="numpy")
+                        batch_size=args.eval_batch_size)
 
                     save_images(generated_images, epoch, args)
 

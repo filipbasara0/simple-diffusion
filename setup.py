@@ -13,7 +13,7 @@ def read_long_description():
 setup(
     name='simple-diffusion',
     packages=find_packages(exclude=['notebooks']),
-    version='0.1.0',
+    version='0.2.0',
     license='MIT',
     description=
     'A minimal implementation of diffusion with a DDIM scheduler in PyTorch',
