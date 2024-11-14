@@ -86,7 +86,7 @@ class ResidualBlock(nn.Module):
         x = self.norm1(x)
         x = self.nonlinearity(x)
 
-        temb = self.time_emb_proj(self.nonlinearity(temb))
+        temb = self.time_emb_proj(temb)
         x += temb[:, :, None, None]
 
         x = self.conv2(x)
