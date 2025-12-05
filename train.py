@@ -36,12 +36,54 @@ def _grayscale_to_rgb(img):
     return img
 
 
+def sample_timesteps_lognormal(batch_size, num_timesteps, mean=0.0, std=1.0, device='cpu'):
+    """Sample timesteps using log-normal distribution.
+    
+    This biases sampling towards middle timesteps where most learning happens,
+    rather than uniform sampling which overweights very noisy/clean timesteps.
+    """
+    u = torch.normal(mean=mean, std=std, size=(batch_size,), device=device)
+    u = torch.sigmoid(u)  # Map to [0, 1]
+    timesteps = (u * num_timesteps).long().clamp(0, num_timesteps - 1)
+    return timesteps
+
+
+def get_snr_weights(timesteps, alphas_cumprod, gamma=5.0):
+    """Compute Min-SNR-γ weights for loss rebalancing.
+    
+    From: https://arxiv.org/abs/2303.09556
+    This prevents high-SNR (low noise) timesteps from dominating the loss.
+    
+    Args:
+        timesteps: Sampled timesteps
+        alphas_cumprod: Cumulative product of alphas from noise schedule
+        gamma: SNR clipping value (default 5.0 works well)
+    
+    Returns:
+        Per-sample weights for the loss
+    """
+    alphas = alphas_cumprod[timesteps]
+    snr = alphas / (1 - alphas)
+    # Clamp SNR and compute weight
+    weight = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+    return weight
+
+
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Model initialization - conditioning placeholder for future CFG support
+    # When adding text conditioning, add: context_dim=768 (or your text encoder dim)
     model = UNet(3, image_size=args.resolution, hidden_dims=[64, 128, 256, 512],
                  use_flash_attn=args.use_flash_attn)
-    noise_scheduler = DDIMScheduler(num_train_timesteps=n_timesteps,
-                                    beta_schedule="cosine")
+    
+    # Scheduler with v-prediction and shifted cosine schedule
+    noise_scheduler = DDIMScheduler(
+        num_train_timesteps=n_timesteps,
+        beta_schedule=args.beta_schedule,
+        prediction_type=args.prediction_type,
+        beta_schedule_shift=args.beta_schedule_shift,
+    )
     model = model.to(device)
 
     if args.pretrained_model_path:
@@ -120,36 +162,88 @@ def main(args):
     scaler = GradScaler(enabled=args.fp16_precision)
     global_step = 0
     losses = []
+    
+    # Get alphas_cumprod for min-SNR weighting
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
+    
     for epoch in range(args.num_epochs):
         progress_bar = tqdm(total=steps_per_epcoch)
         progress_bar.set_description(f"Epoch {epoch}")
         losses_log = 0
         for step, batch in enumerate(train_dataloader):
             orig_images = batch["image"].to(device)
-
             batch_size = orig_images.shape[0]
-            noise = torch.randn(orig_images.shape).to(device)
-            timesteps = torch.randint(0,
-                                      noise_scheduler.num_train_timesteps,
-                                      (batch_size,),
-                                      device=device).long()
-            noisy_images = noise_scheduler.add_noise(orig_images, noise,
-                                                     timesteps)
+            
+            # Generate noise with optional noise offset for better color distribution
+            noise = torch.randn(orig_images.shape, device=device)
+            if args.noise_offset > 0:
+                # Add channel-wise noise offset - helps with very dark/bright images
+                noise = noise + args.noise_offset * torch.randn(
+                    batch_size, orig_images.shape[1], 1, 1, device=device
+                )
+            
+            # Sample timesteps using log-normal distribution (or uniform if disabled)
+            if args.use_lognormal_sampling:
+                timesteps = sample_timesteps_lognormal(
+                    batch_size, 
+                    noise_scheduler.num_train_timesteps,
+                    mean=args.lognormal_mean,
+                    std=args.lognormal_std,
+                    device=device
+                )
+            else:
+                timesteps = torch.randint(
+                    0, noise_scheduler.num_train_timesteps,
+                    (batch_size,), device=device
+                ).long()
+            
+            noisy_images = noise_scheduler.add_noise(orig_images, noise, timesteps)
 
             optimizer.zero_grad()
             with autocast(enabled=args.fp16_precision):
-                noise_pred = model(noisy_images, timesteps)["sample"]
-                loss = F.l1_loss(noise_pred, noise)
+                # Model prediction - currently unconditional
+                # For CFG: pass context=text_embeddings here, and randomly drop context
+                # during training (e.g., 10% of the time set context=None)
+                model_output = model(noisy_images, timesteps)["sample"]
+                
+                # Compute target based on prediction type
+                if args.prediction_type == "v_prediction":
+                    # v-prediction: v = sqrt(alpha) * noise - sqrt(1-alpha) * sample
+                    target = noise_scheduler.get_velocity(orig_images, noise, timesteps)
+                else:
+                    # epsilon prediction (standard)
+                    target = noise
+                
+                # Compute per-sample loss
+                if args.loss_type == "l1":
+                    loss_per_sample = F.l1_loss(model_output, target, reduction='none')
+                else:  # l2/mse
+                    loss_per_sample = F.mse_loss(model_output, target, reduction='none')
+                
+                # Reduce over non-batch dimensions
+                loss_per_sample = loss_per_sample.mean(dim=[1, 2, 3])
+                
+                # Apply Min-SNR-γ weighting
+                if args.use_snr_weighting:
+                    snr_weights = get_snr_weights(
+                        timesteps, alphas_cumprod, gamma=args.snr_gamma
+                    )
+                    loss = (loss_per_sample * snr_weights).mean()
+                else:
+                    loss = loss_per_sample.mean()
 
             scaler.scale(loss).backward()
+            
+            # Fix: Gradient clipping BEFORE optimizer step
+            if args.use_clip_grad:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), 1.0)
+            
             scaler.step(optimizer)
             scaler.update()
 
             ema.update_params(gamma)
             gamma = ema.update_gamma(global_step)
-
-            if args.use_clip_grad:
-                clip_grad_norm_(model.parameters(), 1.0)
 
             lr_scheduler.step()
 
@@ -233,6 +327,60 @@ if __name__ == "__main__":
                     default=0.996,
                     type=float,
                     help='Initial EMA coefficient')
+    
+    # === New diffusion improvements ===
+    # Prediction type
+    parser.add_argument('--prediction_type',
+                        type=str,
+                        default='v_prediction',
+                        choices=['epsilon', 'v_prediction'],
+                        help='Prediction target: epsilon (noise) or v_prediction')
+    
+    # Loss type
+    parser.add_argument('--loss_type',
+                        type=str,
+                        default='l1',
+                        choices=['l1', 'l2'],
+                        help='Loss function: l1 or l2 (mse)')
+    
+    # Noise schedule
+    parser.add_argument('--beta_schedule',
+                        type=str,
+                        default='shifted_cosine',
+                        choices=['cosine', 'shifted_cosine', 'linear'],
+                        help='Beta schedule type')
+    parser.add_argument('--beta_schedule_shift',
+                        type=float,
+                        default=1.0,
+                        help='Shift for shifted_cosine schedule (>1 = more noise)')
+    
+    # Noise offset for better color distribution
+    parser.add_argument('--noise_offset',
+                        type=float,
+                        default=0.1,
+                        help='Noise offset for better dark/bright image generation (try 0.1)')
+    
+    # Min-SNR weighting
+    parser.add_argument('--use_snr_weighting',
+                        action='store_true',
+                        help='Use Min-SNR-gamma loss weighting')
+    parser.add_argument('--snr_gamma',
+                        type=float,
+                        default=5.0,
+                        help='Gamma value for Min-SNR weighting')
+    
+    # Log-normal timestep sampling
+    parser.add_argument('--use_lognormal_sampling',
+                        action='store_true',
+                        help='Use log-normal distribution for timestep sampling')
+    parser.add_argument('--lognormal_mean',
+                        type=float,
+                        default=0.0,
+                        help='Mean for log-normal timestep sampling')
+    parser.add_argument('--lognormal_std',
+                        type=float,
+                        default=1.0,
+                        help='Std for log-normal timestep sampling')
 
     args = parser.parse_args()
 
